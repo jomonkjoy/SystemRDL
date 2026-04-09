@@ -1,0 +1,756 @@
+// ================================================================
+// csr_macros.rdl
+// Reusable SystemRDL Macro Library
+//
+// Usage:
+//   `include "csr_macros.rdl"   (or compile alongside your top rdl)
+//
+// Provides typed fields and regfile templates for:
+//   1.  Interrupt Bank       (enable / status W1C / force)
+//   2.  Counter              (free-running, saturable, clearable)
+//   3.  Scratch Register     (32-bit read/write)
+//   4.  ID / Version         (read-only ROM register)
+//   5.  Control Register     (enable / reset / mode)
+//   6.  Status Register      (multi-flag read-only)
+//   7.  Timer / Watchdog     (load + count + expire)
+//   8.  FIFO Status          (fill-level + flags)
+//   9.  DMA Descriptor       (base addr + length + ctrl)
+//   10. Lock / Privilege     (password-protected write)
+//   11. Capability / Feature (read-only feature bitmask)
+//   12. Error / Fault        (sticky multi-source W1C)
+// ================================================================
+
+
+// ----------------------------------------------------------------
+// Base Field Types
+//   These are the building blocks used by every regfile below.
+// ----------------------------------------------------------------
+
+// RW  — software read/write, hardware reads the written value
+field rw_t  { hw = r;  sw = rw; };
+
+// RO  — hardware writes, software reads only (status signals)
+field ro_t  { hw = rw; sw = r;  };
+
+// WO  — software writes only (e.g. command strobes); hw reads
+field wo_t  { hw = r;  sw = w;  };
+
+// W1C — write-1-to-clear; hardware sets, software clears
+//        Classic sticky interrupt / error flag pattern
+field w1c_t { hw = rw; sw = rw; onwrite = woclr; };
+
+// W1S — write-1-to-set; software sets a bit, hardware can read
+//        Used for interrupt force / software-trigger registers
+field w1s_t { hw = r;  sw = rw; onwrite = woset; };
+
+// W0C — write-0-to-clear (less common, some legacy peripherals)
+// W0C (write-0-to-clear) is not supported in SystemRDL 1.0/2.0 standard.
+// Use w1c_t with inverted polarity in RTL instead.
+// field w0c_t { ... };  <-- omitted
+
+// RC  — read-to-clear; reading the field clears it automatically
+//        Useful for FIFO pop or event latching
+field rc_t  { hw = rw; sw = r;  onread = rclr; };
+
+// PULSE — software writes 1, field auto-clears next cycle
+//         Used for one-shot command bits (soft-reset, etc.)
+field pulse_t { hw = r; sw = rw; singlepulse; };
+
+
+// ================================================================
+// 1. INTERRUPT BANK
+//    Three-register pattern: ENABLE / STATUS (W1C) / FORCE (W1S)
+//    Instantiate once per interrupt source group (up to 32 bits).
+//
+//    Example:
+//      intr_bank_t DMA_IRQ  @ 0x100;
+//      intr_bank_t UART_IRQ @ 0x110;
+// ================================================================
+
+regfile intr_bank_t {
+    name = "Interrupt Bank (Enable / Status / Force)";
+
+    // -- Interrupt Enable ------------------------------------------
+    reg intr_en_t {
+        name = "Interrupt Enable";
+        desc = "Each bit enables the corresponding interrupt source.
+                0 = masked, 1 = enabled.";
+        default hw = r; default sw = rw;
+        rw_t EN[32] = 32'h0000_0000;
+        EN->desc = "Per-bit interrupt enable mask";
+    };
+
+    // -- Interrupt Status (W1C) ------------------------------------
+    reg intr_status_t {
+        name = "Interrupt Status";
+        desc = "Sticky flags set by hardware. Write 1 to clear each bit.";
+        default hw = rw; default sw = rw;
+        w1c_t STATUS[32] = 32'h0000_0000;
+        STATUS->desc = "Pending interrupt bits. W1C.";
+    };
+
+    // -- Interrupt Force (W1S) -------------------------------------
+    //    Software can inject a fake interrupt for testing / debug.
+    reg intr_force_t {
+        name = "Interrupt Force";
+        desc = "Write 1 to artificially assert an interrupt (test use).";
+        default hw = r; default sw = rw;
+        w1s_t FORCE[32] = 32'h0000_0000;
+        FORCE->desc = "Write-1-to-set: OR'd into STATUS";
+    };
+
+    intr_en_t     ENABLE @ 0x00;
+    intr_status_t STATUS @ 0x04;
+    intr_force_t  FORCE  @ 0x08;
+};
+
+
+// ================================================================
+// 2. COUNTER BANK
+//    Free-running hardware counter with optional saturation flag.
+//    Write any value to COUNT to clear (W0C / woclr on full reg).
+//
+//    Example:
+//      counter_bank_t RX_BYTES @ 0x200;
+// ================================================================
+
+regfile counter_bank_t {
+    name = "Counter Bank (Count + Saturate flag + Clear)";
+
+    // -- Counter Value (32-bit, hardware increments) ---------------
+    reg counter_val_t {
+        name = "Counter Value";
+        desc = "32-bit free-running counter. Write any value to clear.";
+        default hw = r; default sw = rw;
+
+        // The counter value itself — hw increments, sw can zero it
+        rw_t COUNT[32] = 32'h0000_0000;
+        COUNT->desc = "Current counter value. Write 0 to clear.";
+    };
+
+    // -- Counter High (upper 32-bits for 64-bit counters) ----------
+    reg counter_hi_t {
+        name = "Counter High Word";
+        desc = "Upper 32 bits of a 64-bit counter. Read after COUNT.";
+        default hw = rw; default sw = r;
+        ro_t COUNT_HI[32] = 32'h0000_0000;
+        COUNT_HI->desc = "Upper 32 bits. Snapshot latched on COUNT read.";
+    };
+
+    // -- Counter Config --------------------------------------------
+    reg counter_cfg_t {
+        name = "Counter Config";
+        desc = "Configure counter behaviour.";
+        default hw = r; default sw = rw;
+
+        rw_t ENABLE[1] = 1'b0;
+        ENABLE->desc = "1 = counter runs, 0 = frozen";
+
+        rw_t SATURATE[1] = 1'b0;
+        SATURATE->desc = "1 = hold at max on overflow, 0 = wrap";
+
+        rw_t ONE_SHOT[1] = 1'b0;
+        ONE_SHOT->desc = "1 = stop counting after first overflow";
+
+        rw_t PRESCALE[8] = 8'h00;
+        PRESCALE->desc = "Clock prescaler: count every (PRESCALE+1) cycles";
+    };
+
+    // -- Counter Status --------------------------------------------
+    reg counter_status_t {
+        name = "Counter Status";
+        desc = "Read-only counter flags.";
+        default hw = rw; default sw = r;
+
+        ro_t OVERFLOW[1] = 1'b0;
+        OVERFLOW->desc = "1 = counter wrapped or saturated at least once";
+
+        ro_t ACTIVE[1] = 1'b0;
+        ACTIVE->desc = "1 = counter is currently running";
+    };
+
+    counter_cfg_t    CFG    @ 0x00;
+    counter_val_t    COUNT  @ 0x04;
+    counter_hi_t     COUNT_HI @ 0x08;
+    counter_status_t STATUS @ 0x0C;
+};
+
+
+// ================================================================
+// 3. SCRATCH REGISTER
+//    Simple 32-bit read/write with no hardware side-effects.
+//    Useful for software communication, debug, or boot flags.
+//
+//    Example:
+//      scratch_reg_t SCRATCH0 @ 0x300;
+//      scratch_reg_t SCRATCH1 @ 0x304;
+// ================================================================
+
+regfile scratch_reg_t {
+    name = "Scratch Register";
+
+    reg scratch_t {
+        name = "Scratch";
+        desc = "General-purpose 32-bit R/W register. No HW function.";
+        default hw = r; default sw = rw;
+        rw_t DATA[32] = 32'hDEAD_BEEF;
+        DATA->desc = "Scratch value — software use only";
+    };
+
+    scratch_t SCRATCH @ 0x00;
+};
+
+
+// ================================================================
+// 4. ID / VERSION REGISTER
+//    Hard-coded ROM values read by software to identify the block.
+//
+//    Example:
+//      id_reg_t UART_ID @ 0x400;
+// ================================================================
+
+regfile id_reg_t {
+    name = "Block Identification Registers";
+
+    // -- Peripheral ID ---------------------------------------------
+    reg periph_id_t {
+        name = "Peripheral ID";
+        desc = "Hard-coded peripheral type and revision fields.";
+        default hw = rw; default sw = r;
+
+        ro_t PATCH[4]  = 4'h0;
+        PATCH->desc = "Patch revision (bug-fix releases)";
+
+        ro_t MINOR[4]  = 4'h0;
+        MINOR->desc = "Minor revision (compatible changes)";
+
+        ro_t MAJOR[4]  = 4'h1;
+        MAJOR->desc = "Major revision (breaking changes)";
+
+        ro_t PERIPH[16] = 16'h0000;
+        PERIPH->desc = "Peripheral type code (assigned by design team)";
+
+        ro_t VENDOR[4]  = 4'h0;
+        VENDOR->desc = "Vendor/team identifier";
+    };
+
+    // -- Peripheral GUID / Magic -----------------------------------
+    reg periph_magic_t {
+        name = "Peripheral Magic Number";
+        desc = "Fixed magic number for positive peripheral identification.";
+        default hw = rw; default sw = r;
+        ro_t MAGIC[32] = 32'hC5_C5_C5_C5;
+        MAGIC->desc = "Hard-coded magic constant";
+    };
+
+    periph_id_t    PID   @ 0x00;
+    periph_magic_t MAGIC @ 0x04;
+};
+
+
+// ================================================================
+// 5. CONTROL REGISTER
+//    Common enable / soft-reset / mode / endian / clk-gate bits.
+//
+//    Example:
+//      ctrl_reg_t DMA_CTRL @ 0x500;
+// ================================================================
+
+regfile ctrl_reg_t {
+    name = "Standard Control Register";
+
+    reg ctrl_t {
+        name = "Control";
+        desc = "Master control: enable, reset, operating mode.";
+        default hw = r; default sw = rw;
+
+        pulse_t SOFT_RST[1] = 1'b0;
+        SOFT_RST->desc = "Write 1 to assert a one-cycle soft reset";
+
+        rw_t ENABLE[1] = 1'b0;
+        ENABLE->desc = "1 = peripheral is active";
+
+        rw_t CLKGATE[1] = 1'b0;
+        CLKGATE->desc = "1 = allow clock gating when idle";
+
+        rw_t ENDIAN[1] = 1'b0;
+        ENDIAN->desc = "0 = little-endian, 1 = big-endian";
+
+        rw_t MODE[4] = 4'h0;
+        MODE->desc = "Operating mode select (peripheral-specific)";
+
+        rw_t POWER[2] = 2'b11;
+        POWER->desc = "Power state: 00=off 01=sleep 10=idle 11=run";
+
+        rw_t LOOPBACK[1] = 1'b0;
+        LOOPBACK->desc = "1 = internal loopback (test/debug)";
+    };
+
+    ctrl_t CTRL @ 0x00;
+};
+
+
+// ================================================================
+// 6. STATUS REGISTER
+//    Read-only multi-flag status: ready, busy, errors, FSM state.
+//
+//    Example:
+//      status_reg_t DMA_STATUS @ 0x600;
+// ================================================================
+
+regfile status_reg_t {
+    name = "Standard Status Register";
+
+    reg status_t {
+        name = "Status";
+        desc = "Live read-only status flags from hardware.";
+        default hw = rw; default sw = r;
+
+        ro_t READY[1] = 1'b0;
+        READY->desc = "1 = peripheral ready and idle";
+
+        ro_t BUSY[1] = 1'b0;
+        BUSY->desc = "1 = peripheral actively processing";
+
+        ro_t ERROR[1] = 1'b0;
+        ERROR->desc = "1 = a fault condition is asserted (see FAULT reg)";
+
+        ro_t FSM_STATE[4] = 4'h0;
+        FSM_STATE->desc = "Current FSM state (debug visibility)";
+
+        ro_t IDLE[1] = 1'b1;
+        IDLE->desc = "1 = no pending work in any queue";
+
+        ro_t CLK_ACTIVE[1] = 1'b0;
+        CLK_ACTIVE->desc = "1 = peripheral clock domain is active";
+    };
+
+    status_t STATUS @ 0x00;
+};
+
+
+// ================================================================
+// 7. TIMER / WATCHDOG BANK
+//    Programmable down-counter.  Load → arm → fires interrupt.
+//    Write the KICK register to reset watchdog before expiry.
+//
+//    Example:
+//      timer_bank_t WDT @ 0x700;
+// ================================================================
+
+regfile timer_bank_t {
+    name = "Timer / Watchdog Bank";
+
+    // -- Timer Load ------------------------------------------------
+    reg timer_load_t {
+        name = "Timer Load Value";
+        desc = "Reload value. Written to COUNT on each restart.";
+        default hw = r; default sw = rw;
+        rw_t LOAD[32] = 32'hFFFF_FFFF;
+        LOAD->desc = "Down-counter reload value (clock cycles)";
+    };
+
+    // -- Timer Count (live, read-only) -----------------------------
+    reg timer_count_t {
+        name = "Timer Current Count";
+        desc = "Current down-counter value. Read-only.";
+        default hw = rw; default sw = r;
+        ro_t COUNT[32] = 32'hFFFF_FFFF;
+        COUNT->desc = "Live counter snapshot";
+    };
+
+    // -- Timer Control ---------------------------------------------
+    reg timer_ctrl_t {
+        name = "Timer Control";
+        desc = "Enable, mode, and interrupt-enable for the timer.";
+        default hw = r; default sw = rw;
+
+        rw_t ENABLE[1] = 1'b0;
+        ENABLE->desc = "1 = timer runs";
+
+        rw_t PERIODIC[1] = 1'b1;
+        PERIODIC->desc = "1 = auto-reload on expiry, 0 = one-shot";
+
+        rw_t INT_EN[1] = 1'b0;
+        INT_EN->desc = "1 = generate interrupt on expiry";
+
+        rw_t WDT_MODE[1] = 1'b0;
+        WDT_MODE->desc = "1 = watchdog mode (system reset on expiry)";
+    };
+
+    // -- Timer Status / Kick ---------------------------------------
+    reg timer_status_t {
+        name = "Timer Status & Watchdog Kick";
+        desc = "Status flags + write any value to kick the watchdog.";
+        default hw = rw; default sw = rw;
+
+        w1c_t EXPIRED[1] = 1'b0;
+        EXPIRED->desc = "Set when count reaches 0. W1C.";
+
+        rw_t KICK[1] = 1'b0;
+        KICK->desc = "Write any value to restart watchdog countdown";
+    };
+
+    timer_ctrl_t   CTRL   @ 0x00;
+    timer_load_t   LOAD   @ 0x04;
+    timer_count_t  COUNT  @ 0x08;
+    timer_status_t STATUS @ 0x0C;
+};
+
+
+// ================================================================
+// 8. FIFO STATUS BANK
+//    Tracks depth, thresholds, and overflow/underflow flags.
+//
+//    Example:
+//      fifo_status_t TX_FIFO @ 0x800;
+// ================================================================
+
+regfile fifo_status_t {
+    name = "FIFO Status and Threshold Bank";
+
+    // -- FIFO Fill Level -------------------------------------------
+    reg fifo_level_t {
+        name = "FIFO Fill Level";
+        desc = "Current number of entries in the FIFO.";
+        default hw = rw; default sw = r;
+        ro_t LEVEL[16] = 16'h0000;
+        LEVEL->desc = "Current fill depth (entries)";
+        ro_t MAX_LEVEL[16] = 16'h0000;
+        MAX_LEVEL->desc = "Watermark: maximum depth reached since reset";
+    };
+
+    // -- FIFO Threshold Config ------------------------------------
+    reg fifo_thresh_t {
+        name = "FIFO Thresholds";
+        desc = "Programmable almost-full and almost-empty thresholds.";
+        default hw = r; default sw = rw;
+        rw_t ALMOST_FULL[16]  = 16'hF000;
+        ALMOST_FULL->desc = "Assert AF flag when level >= this value";
+        rw_t ALMOST_EMPTY[16] = 16'h0010;
+        ALMOST_EMPTY->desc = "Assert AE flag when level <= this value";
+    };
+
+    // -- FIFO Flags (sticky) --------------------------------------
+    reg fifo_flags_t {
+        name = "FIFO Flags";
+        desc = "Live and sticky status flags for the FIFO.";
+        default hw = rw; default sw = rw;
+
+        ro_t EMPTY[1] = 1'b1;
+        EMPTY->desc = "1 = FIFO is empty";
+
+        ro_t FULL[1] = 1'b0;
+        FULL->desc = "1 = FIFO is full";
+
+        ro_t ALMOST_EMPTY[1] = 1'b1;
+        ALMOST_EMPTY->desc = "1 = level at or below ALMOST_EMPTY threshold";
+
+        ro_t ALMOST_FULL[1] = 1'b0;
+        ALMOST_FULL->desc = "1 = level at or above ALMOST_FULL threshold";
+
+        w1c_t OVERFLOW[1]  = 1'b0;
+        OVERFLOW->desc  = "Sticky: write to full FIFO. W1C.";
+
+        w1c_t UNDERFLOW[1] = 1'b0;
+        UNDERFLOW->desc = "Sticky: read from empty FIFO. W1C.";
+    };
+
+    // -- FIFO Control (flush) -------------------------------------
+    reg fifo_ctrl_t {
+        name = "FIFO Control";
+        desc = "Flush and enable control.";
+        default hw = r; default sw = rw;
+
+        pulse_t FLUSH[1] = 1'b0;
+        FLUSH->desc = "Write 1 to flush the FIFO (one-cycle pulse)";
+
+        rw_t ENABLE[1] = 1'b1;
+        ENABLE->desc = "1 = FIFO is active";
+    };
+
+    fifo_ctrl_t   CTRL   @ 0x00;
+    fifo_thresh_t THRESH @ 0x04;
+    fifo_level_t  LEVEL  @ 0x08;
+    fifo_flags_t  FLAGS  @ 0x0C;
+};
+
+
+// ================================================================
+// 9. DMA DESCRIPTOR REGISTERS
+//    Source/destination address + transfer length + control.
+//
+//    Example:
+//      dma_desc_t CH0 @ 0x900;
+//      dma_desc_t CH1 @ 0x920;
+// ================================================================
+
+regfile dma_desc_t {
+    name = "DMA Channel Descriptor";
+
+    reg dma_src_t {
+        name = "DMA Source Address";
+        desc = "Base address of the DMA source buffer.";
+        default hw = r; default sw = rw;
+        rw_t ADDR[32] = 32'h0000_0000;
+        ADDR->desc = "Source start address (must be aligned to burst size)";
+    };
+
+    reg dma_dst_t {
+        name = "DMA Destination Address";
+        desc = "Base address of the DMA destination buffer.";
+        default hw = r; default sw = rw;
+        rw_t ADDR[32] = 32'h0000_0000;
+        ADDR->desc = "Destination start address";
+    };
+
+    reg dma_len_t {
+        name = "DMA Transfer Length";
+        desc = "Number of bytes to transfer.";
+        default hw = r; default sw = rw;
+        rw_t BYTES[24] = 24'h00_0000;
+        BYTES->desc = "Transfer size in bytes (max 16 MB per descriptor)";
+        rw_t BURST[4] = 4'h4;
+        BURST->desc = "Burst size: 2^BURST bytes per AXI beat";
+    };
+
+    reg dma_ctrl_t {
+        name = "DMA Channel Control";
+        desc = "Trigger and configure a DMA transfer.";
+        default hw = r; default sw = rw;
+
+        pulse_t START[1] = 1'b0;
+        START->desc = "Write 1 to start the transfer";
+
+        rw_t    STOP[1]  = 1'b0;
+        STOP->desc = "Write 1 to abort ongoing transfer";
+
+        rw_t    CIRCULAR[1] = 1'b0;
+        CIRCULAR->desc = "1 = auto-restart on completion";
+
+        rw_t    INT_EN[1] = 1'b0;
+        INT_EN->desc = "1 = generate interrupt on completion or error";
+
+        rw_t    PRIORITY[2] = 2'b00;
+        PRIORITY->desc = "Arbitration priority (3=highest)";
+    };
+
+    reg dma_status_t {
+        name = "DMA Channel Status";
+        desc = "Current transfer state and error flags.";
+        default hw = rw; default sw = rw;
+
+        ro_t BUSY[1] = 1'b0;
+        BUSY->desc = "1 = transfer in progress";
+
+        w1c_t DONE[1] = 1'b0;
+        DONE->desc = "Set on transfer completion. W1C.";
+
+        w1c_t ERROR[1] = 1'b0;
+        ERROR->desc = "Set on bus error. W1C.";
+
+        ro_t BYTES_LEFT[24] = 24'h0;
+        BYTES_LEFT->desc = "Remaining bytes in current transfer";
+    };
+
+    dma_src_t    SRC    @ 0x00;
+    dma_dst_t    DST    @ 0x04;
+    dma_len_t    LEN    @ 0x08;
+    dma_ctrl_t   CTRL   @ 0x0C;
+    dma_status_t STATUS @ 0x10;
+};
+
+
+// ================================================================
+// 10. LOCK / ACCESS PROTECTION
+//     Password-protected write lock.  Write the magic key to
+//     UNLOCK_KEY to enable writes; any other write re-locks.
+//
+//     Example:
+//       lock_reg_t CFG_LOCK @ 0xA00;
+// ================================================================
+
+regfile lock_reg_t {
+    name = "Write-Lock / Access Protection Register";
+
+    reg lock_key_t {
+        name = "Unlock Key";
+        desc = "Write the unlock password to allow protected writes.
+                Any incorrect write re-locks. Reads always return 0.";
+        default hw = rw; default sw = rw;
+
+        // WO: software writes password, hardware validates it
+        wo_t KEY[32] = 32'h0000_0000;
+        KEY->desc = "Write 0xC0DE_CAFE to unlock protected registers";
+    };
+
+    reg lock_status_t {
+        name = "Lock Status";
+        desc = "Current lock state and violation record.";
+        default hw = rw; default sw = rw;
+
+        ro_t LOCKED[1] = 1'b1;
+        LOCKED->desc = "1 = registers are locked (writes ignored)";
+
+        w1c_t VIOLATION[1] = 1'b0;
+        VIOLATION->desc = "Set if a write was attempted while locked. W1C.";
+
+        ro_t UNLOCK_COUNT[8] = 8'h00;
+        UNLOCK_COUNT->desc = "Number of successful unlocks since reset";
+    };
+
+    lock_key_t    KEY    @ 0x00;
+    lock_status_t STATUS @ 0x04;
+};
+
+
+// ================================================================
+// 11. CAPABILITY / FEATURE REGISTER
+//     ROM bitmask that software reads to discover supported
+//     hardware features at runtime (no magic constants in SW).
+//
+//     Example:
+//       cap_reg_t PERIPH_CAP @ 0xB00;
+// ================================================================
+
+regfile cap_reg_t {
+    name = "Capability / Feature Discovery Registers";
+
+    reg cap_features_t {
+        name = "Feature Flags";
+        desc = "Each bit indicates whether a hardware feature is present.";
+        default hw = rw; default sw = r;
+
+        ro_t HAS_DMA[1]      = 1'b0;
+        HAS_DMA->desc = "1 = DMA engine is present";
+
+        ro_t HAS_ECC[1]      = 1'b0;
+        HAS_ECC->desc = "1 = ECC memory protection available";
+
+        ro_t HAS_CRYPTO[1]   = 1'b0;
+        HAS_CRYPTO->desc = "1 = hardware crypto accelerator present";
+
+        ro_t HAS_DEBUG[1]    = 1'b0;
+        HAS_DEBUG->desc = "1 = JTAG / trace debug interface enabled";
+
+        ro_t HAS_WDT[1]      = 1'b0;
+        HAS_WDT->desc = "1 = watchdog timer present";
+
+        ro_t NUM_CHANNELS[8] = 8'h01;
+        NUM_CHANNELS->desc = "Number of DMA / processing channels";
+
+        ro_t FIFO_DEPTH[12]  = 12'h100;
+        FIFO_DEPTH->desc = "Depth of internal FIFOs in entries";
+    };
+
+    reg cap_limits_t {
+        name = "Capacity Limits";
+        desc = "Hardware sizing parameters.";
+        default hw = rw; default sw = r;
+
+        ro_t MAX_BURST[8]   = 8'h10;
+        MAX_BURST->desc = "Maximum DMA burst length in beats";
+
+        ro_t ADDR_WIDTH[6]  = 6'd32;
+        ADDR_WIDTH->desc = "Address bus width in bits";
+
+        ro_t DATA_WIDTH[6]  = 6'd32;
+        DATA_WIDTH->desc = "Data bus width in bits";
+    };
+
+    cap_features_t FEATURES @ 0x00;
+    cap_limits_t   LIMITS   @ 0x04;
+};
+
+
+// ================================================================
+// 12. ERROR / FAULT REGISTER BANK
+//     Multi-source W1C sticky error log with injection support.
+//
+//     Example:
+//       fault_bank_t MEM_FAULT @ 0xC00;
+// ================================================================
+
+regfile fault_bank_t {
+    name = "Error / Fault Register Bank";
+
+    // -- Fault Status (sticky W1C) --------------------------------
+    reg fault_status_t {
+        name = "Fault Status";
+        desc = "Sticky fault flags. Hardware sets, software clears W1C.";
+        default hw = rw; default sw = rw;
+
+        w1c_t PARITY_ERR[1]  = 1'b0;
+        PARITY_ERR->desc  = "Parity error detected";
+
+        w1c_t ECC_CORR[1]    = 1'b0;
+        ECC_CORR->desc    = "ECC single-bit correctable error";
+
+        w1c_t ECC_UNCORR[1]  = 1'b0;
+        ECC_UNCORR->desc  = "ECC double-bit uncorrectable error";
+
+        w1c_t ADDR_ALIGN[1]  = 1'b0;
+        ADDR_ALIGN->desc  = "Misaligned address access";
+
+        w1c_t ACCESS_VIOL[1] = 1'b0;
+        ACCESS_VIOL->desc = "Privilege / access-rights violation";
+
+        w1c_t TIMEOUT[1]     = 1'b0;
+        TIMEOUT->desc     = "Bus timeout occurred";
+
+        w1c_t OVERFLOW[1]    = 1'b0;
+        OVERFLOW->desc    = "Arithmetic or buffer overflow";
+
+        w1c_t UNDERFLOW[1]   = 1'b0;
+        UNDERFLOW->desc   = "Buffer underflow";
+    };
+
+    // -- Fault Enable (mask) --------------------------------------
+    reg fault_en_t {
+        name = "Fault Enable";
+        desc = "Enable bits for each fault source (interrupt generation).";
+        default hw = r; default sw = rw;
+        rw_t EN[32] = 32'h0000_0000;
+        EN->desc = "Bit-for-bit enable mask matching FAULT_STATUS";
+    };
+
+    // -- Fault Inject (debug) -------------------------------------
+    reg fault_inject_t {
+        name = "Fault Inject";
+        desc = "Write 1 to artificially trigger a fault (for test only).";
+        default hw = r; default sw = rw;
+        w1s_t INJECT[32] = 32'h0000_0000;
+        INJECT->desc = "Write-1-to-set: each bit injects the matching fault";
+    };
+
+    // -- Fault Address Capture ------------------------------------
+    reg fault_addr_t {
+        name = "Fault Address";
+        desc = "Address captured at the time of the last fault.";
+        default hw = rw; default sw = r;
+        ro_t ADDR[32] = 32'h0000_0000;
+        ADDR->desc = "Latched address of the faulting transaction";
+    };
+
+    // -- Fault Info -----------------------------------------------
+    reg fault_info_t {
+        name = "Fault Info";
+        desc = "Additional context captured when a fault fires.";
+        default hw = rw; default sw = r;
+
+        ro_t SOURCE[8] = 8'h00;
+        SOURCE->desc = "ID of the bus master that caused the fault";
+
+        ro_t TYPE[4]   = 4'h0;
+        TYPE->desc = "Transaction type: 0=read 1=write 2=fetch ...";
+
+        ro_t SEVERITY[2] = 2'b00;
+        SEVERITY->desc = "0=warn 1=error 2=fatal 3=panic";
+    };
+
+    fault_status_t STATUS @ 0x00;
+    fault_en_t     ENABLE @ 0x04;
+    fault_inject_t INJECT @ 0x08;
+    fault_addr_t   ADDR   @ 0x0C;
+    fault_info_t   INFO   @ 0x10;
+};
