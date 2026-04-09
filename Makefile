@@ -15,10 +15,10 @@
 # =============================================================================
 
 # ── User configuration ────────────────────────────────────────────────────────
-RDL_FILE   ?= example_csr.rdl   # override: make all RDL_FILE=my_chip.rdl
+RDL_FILE   ?= atxmega_spi.rdl   # override: make all RDL_FILE=my_chip.rdl
 OUT_DIR    ?= output
 VENV_DIR   ?= peakrdl_env
-CPU_IF     ?= axi4-lite          # axi4-lite | apb3 | apb4 | passthrough
+CPU_IF     ?= apb4              # axi4-lite | apb3 | apb4 | passthrough
 
 # ── Internal ──────────────────────────────────────────────────────────────────
 SHELL      := /bin/bash
